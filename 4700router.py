@@ -1,7 +1,45 @@
 #!/usr/bin/env -S python3 -u
 
-import argparse, socket, time, json, select, sys, ipaddress
+import argparse, socket, time, json, select, sys
 
+def ip_to_tuple(ip):
+    """Convert an IP address string to a tuple of integers for easy comparison."""
+    return tuple(int(part) for part in ip.split('.'))
+
+def ip_str_to_int(ip):
+    """Convert an IP address string to a 32-bit integer."""
+    parts = list(map(int, ip.split('.')))
+    return (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]
+
+def prefix_mask(prefix_len):
+    """Return a 32-bit mask for the given prefix length."""
+    return (0xFFFFFFFF << (32 - prefix_len)) & 0xFFFFFFFF
+
+def netmask_to_prefix(netmask):
+    """
+    Convert a netmask to a prefix length.
+    If the netmask contains a dot, it is assumed to be in dotted-decimal format.
+    Otherwise, it is assumed to be the prefix length.
+    """
+    if '.' in netmask:
+        m_int = ip_str_to_int(netmask)
+        prefix = 0
+        # Count the number of 1-bits from the left
+        for i in range(32):
+            if m_int & (1 << (31 - i)):
+                prefix += 1
+            else:
+                break
+        return prefix
+    else:
+        return int(netmask)
+
+def ip_in_network(ip, network, prefix_len):
+    """Check if an IP address (string) is in the given network (string) with prefix length."""
+    ip_int = ip_str_to_int(ip)
+    network_int = ip_str_to_int(network)
+    mask = prefix_mask(prefix_len)
+    return (ip_int & mask) == (network_int & mask)
 
 class Router:
     def __init__(self, asn, connections):
@@ -39,28 +77,6 @@ class Router:
     def send(self, network, message):
         print("Sending message to %s: %s" % (network, message))
         self.sockets[network].sendto(message.encode('utf-8'), ('localhost', self.ports[network]))
-
-    def compare_routes(self, route1, route2):
-        """Compare two routes using BGP tie-breaking rules."""
-        # Rule 1: Highest localpref
-        if int(route1['localpref']) != int(route2['localpref']):
-            return int(route1['localpref']) > int(route2['localpref'])
-
-        # Rule 2: selfOrigin
-        if route1['selfOrigin'] != route2['selfOrigin']:
-            return route1['selfOrigin']
-
-        # Rule 3: Shortest ASPath
-        if len(route1['ASPath']) != len(route2['ASPath']):
-            return len(route1['ASPath']) < len(route2['ASPath'])
-
-        # Rule 4: Origin type (IGP > EGP > UNK)
-        origin_priority = {"IGP": 3, "EGP": 2, "UNK": 1}
-        if origin_priority[route1['origin']] != origin_priority[route2['origin']]:
-            return origin_priority[route1['origin']] > origin_priority[route2['origin']]
-
-        # Rule 5: Lowest peer IP
-        return ipaddress.IPv4Address(route1['peer']) < ipaddress.IPv4Address(route2['peer'])
 
     def should_forward_to(self, src_relation, dst_neighbor):
         """Determine if we should forward updates based on BGP relationships."""
@@ -165,26 +181,24 @@ class Router:
         if origin1 != origin2:
             return origin1 > origin2
 
-        # 5. Lowest peer IP
-        return ipaddress.IPv4Address(route1['peer']) < ipaddress.IPv4Address(route2['peer'])
+        # 5. Lowest peer IP (using tuple comparison)
+        return ip_to_tuple(route1['peer']) < ip_to_tuple(route2['peer'])
 
     def lookup_route(self, dest_ip):
         """Find the best route for the given destination IP."""
-        dest = ipaddress.IPv4Address(dest_ip)
+        dest_int = ip_str_to_int(dest_ip)
         matching_routes = []
         best_prefix_len = -1
 
         # First find all matching routes
         for route in self.forwarding_table:
-            network = ipaddress.IPv4Network(f"{route['network']}/{route['netmask']}", strict=False)
-            if dest in network:
-                prefix_len = network.prefixlen
+            # Convert netmask to prefix length (supports both dotted-decimal and prefix notation)
+            prefix_len = netmask_to_prefix(route['netmask'])
+            if ip_in_network(dest_ip, route['network'], prefix_len):
                 if prefix_len > best_prefix_len:
-                    # Found a more specific route, clear previous matches
                     best_prefix_len = prefix_len
                     matching_routes = [route]
                 elif prefix_len == best_prefix_len:
-                    # Found another route with same prefix length, add it
                     matching_routes.append(route)
 
         if not matching_routes:
@@ -248,6 +262,13 @@ class Router:
             'msg': self.forwarding_table
         }))
 
+    def handle_withdraw(self, msg, src_interface):
+        """Handle route withdraw messages (stub implementation)."""
+        # You can implement withdraw logic here
+        print(f"Withdraw message received from {src_interface}: {msg}")
+        self.withdraws.append((msg, src_interface))
+        # For now, we do nothing further.
+
     def run(self):
         """Main event loop."""
         while True:
@@ -279,7 +300,6 @@ class Router:
                     self.handle_withdraw(msg, src_interface)
 
             time.sleep(0.01)
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='route packets')

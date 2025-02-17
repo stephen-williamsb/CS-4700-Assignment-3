@@ -1,28 +1,90 @@
 #!/usr/bin/env -S python3 -u
 
-import argparse, socket, time, json, select, sys, ipaddress
+import argparse, socket, time, json, select, sys
 
 
+# Helper function: Convert an IP address string into a tuple of integers.
+def ip_to_tuple(ip):
+    """
+    Convert an IP address string to a tuple of integers for easy comparison.
+    """
+    return tuple(int(part) for part in ip.split('.'))
+
+
+# Helper function: Convert an IP address string into a 32-bit integer.
+def ip_str_to_int(ip):
+    """
+    Convert an IP address string to a 32-bit integer.
+    """
+    parts = list(map(int, ip.split('.')))
+    return (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]
+
+
+# Helper function: Create a network mask (32-bit integer) from a given prefix length.
+def prefix_mask(prefix_len):
+    """
+    Return a 32-bit mask for the given prefix length.
+    """
+    return (0xFFFFFFFF << (32 - prefix_len)) & 0xFFFFFFFF
+
+
+# Helper function: Convert a netmask (either dotted-decimal or a prefix length) into a prefix length.
+def netmask_to_prefix(netmask):
+    """
+    Convert a netmask to a prefix length.
+
+    If the netmask contains a dot, it is assumed to be in dotted-decimal format.
+    Otherwise, it is assumed to be the prefix length.
+    """
+    if '.' in netmask:
+        m_int = ip_str_to_int(netmask)
+        prefix = 0
+        # Count the number of 1-bits from the left until a 0 is encountered.
+        for i in range(32):
+            if m_int & (1 << (31 - i)):
+                prefix += 1
+            else:
+                break
+        return prefix
+    else:
+        return int(netmask)
+
+
+# Helper function: Determine if a given IP address belongs to a network defined by a base IP and prefix length.
+def ip_in_network(ip, network, prefix_len):
+    """
+    Check if an IP address (string) is in the given network (string) with prefix length.
+    """
+    ip_int = ip_str_to_int(ip)
+    network_int = ip_str_to_int(network)
+    mask = prefix_mask(prefix_len)
+    return (ip_int & mask) == (network_int & mask)
+
+
+# Router class encapsulates the behavior of a BGP-like router
 class Router:
     def __init__(self, asn, connections):
+        # Announce the startup of the router with its Autonomous System Number (ASN)
         print("Router at AS %s starting up" % asn)
         self.asn = asn
-        self.relations = {}  # Neighbor relationship type (peer/provider/customer)
-        self.sockets = {}  # UDP sockets for each neighbor
-        self.ports = {}  # Port numbers for each neighbor
-        self.updates = []  # Store all received updates
-        self.withdraws = []  # Store all received withdraws
-        self.forwarding_table = []  # Current routing table
+        self.relations = {}  # Stores relationship type (peer/provider/customer) per neighbor.
+        self.sockets = {}  # UDP sockets for each neighbor.
+        self.ports = {}  # Port numbers corresponding to each neighbor.
+        self.updates = []  # Log of all received update messages.
+        self.withdraws = []  # Log of all received withdraw messages.
+        self.forwarding_table = []  # The router's current routing (forwarding) table.
 
-        # Initialize connections
+        # Initialize connections based on provided arguments.
+        # Each connection is expected to be in the format: "port-neighbor-relation"
         for relationship in connections:
             port, neighbor, relation = relationship.split("-")
+            # Create a UDP socket for the neighbor and bind to an available port on localhost.
             self.sockets[neighbor] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.sockets[neighbor].bind(('localhost', 0))
             self.ports[neighbor] = int(port)
             self.relations[neighbor] = relation
 
-            # Send initial handshake
+            # Send an initial handshake message to the neighbor.
             self.send(neighbor, json.dumps({
                 "type": "handshake",
                 "src": self.our_addr(neighbor),
@@ -31,57 +93,66 @@ class Router:
             }))
 
     def our_addr(self, dst):
-        # Get our address on the interface to a neighbor
+        """
+        Derive our local interface address for a given neighbor.
+
+        This implementation sets the last octet to 1. For example,
+        if the neighbor is "192.168.1.2", this function returns "192.168.1.1".
+        """
         quads = [int(q) for q in dst.split('.')]
         quads[3] = 1
         return "%d.%d.%d.%d" % (quads[0], quads[1], quads[2], quads[3])
 
     def send(self, network, message):
+        """
+        Send a message (as a JSON string) to a neighbor via its UDP socket.
+
+        Parameters:
+            network (str): The neighbor's address.
+            message (str): The JSON-formatted message to send.
+        """
         print("Sending message to %s: %s" % (network, message))
         self.sockets[network].sendto(message.encode('utf-8'), ('localhost', self.ports[network]))
 
-    def compare_routes(self, route1, route2):
-        """Compare two routes using BGP tie-breaking rules."""
-        # Rule 1: Highest localpref
-        if int(route1['localpref']) != int(route2['localpref']):
-            return int(route1['localpref']) > int(route2['localpref'])
-
-        # Rule 2: selfOrigin
-        if route1['selfOrigin'] != route2['selfOrigin']:
-            return route1['selfOrigin']
-
-        # Rule 3: Shortest ASPath
-        if len(route1['ASPath']) != len(route2['ASPath']):
-            return len(route1['ASPath']) < len(route2['ASPath'])
-
-        # Rule 4: Origin type (IGP > EGP > UNK)
-        origin_priority = {"IGP": 3, "EGP": 2, "UNK": 1}
-        if origin_priority[route1['origin']] != origin_priority[route2['origin']]:
-            return origin_priority[route1['origin']] > origin_priority[route2['origin']]
-
-        # Rule 5: Lowest peer IP
-        return ipaddress.IPv4Address(route1['peer']) < ipaddress.IPv4Address(route2['peer'])
-
     def should_forward_to(self, src_relation, dst_neighbor):
-        """Determine if we should forward updates based on BGP relationships."""
+        """
+        Determine if an update message should be forwarded to a particular neighbor
+        based on BGP relationship policies.
+
+        Parameters:
+            src_relation (str): The relationship of the neighbor that sent the update.
+            dst_neighbor (str): The neighbor to which we may forward the update.
+
+        Returns:
+            bool: True if the update should be forwarded, False otherwise.
+        """
         dst_relation = self.relations[dst_neighbor]
 
-        # From customer: announce to everyone
+        # If the update comes from a customer, forward to everyone.
         if src_relation == 'cust':
             return True
 
-        # From peer/provider: only announce to customers
+        # If the update comes from a peer or provider, only forward it to customers.
         return dst_relation == 'cust'
 
     def handle_update(self, msg, src_interface):
-        """Process route announcements."""
+        """
+        Process a route update (announcement) message received from a neighbor.
+
+        Steps:
+            - Parse and store the update.
+            - Create a route entry from the update.
+            - Avoid processing routes that form loops by checking ASPath.
+            - Update the routing table.
+            - Forward the update to other appropriate neighbors.
+        """
         update = msg['msg']
         src_relation = self.relations[src_interface]
 
-        # Store the update
+        # Log the update along with the source interface.
         self.updates.append((msg, src_interface))
 
-        # Create route entry
+        # Create a route entry from the update.
         route = {
             'network': update['network'],
             'netmask': update['netmask'],
@@ -92,20 +163,21 @@ class Router:
             'peer': msg['src']
         }
 
-        # Don't process routes that loop back through our AS
+        # Prevent loops: do not process routes that already include our ASN.
         if self.asn in route['ASPath']:
             return
 
-        # Update forwarding table
+        # Update or add the route into our forwarding table.
         self.add_or_update_route(route)
 
-        # Forward update to appropriate neighbors
+        # Prepare a forwarded update by adding our ASN to the ASPath.
         forwarded_update = {
             'network': update['network'],
             'netmask': update['netmask'],
             'ASPath': [self.asn] + route['ASPath']
         }
 
+        # Forward the update to neighbors, based on relationship rules.
         for neighbor in self.sockets:
             if neighbor != src_interface and self.should_forward_to(src_relation, neighbor):
                 self.send(neighbor, json.dumps({
@@ -117,15 +189,20 @@ class Router:
 
     def add_or_update_route(self, new_route):
         """
-        Add a new route to the forwarding table. Keep both routes if they're
-        for the same network but from different peers.
+        Add a new route to the forwarding table or update an existing one.
+
+        If a route for the same network and netmask from the same peer exists,
+        update it; otherwise, append the new route.
+
+        Parameters:
+            new_route (dict): A dictionary containing route information.
         """
-        # Find all existing routes for this network
+        # Identify existing routes for the same network and netmask.
         existing_routes = [r for r in self.forwarding_table
                            if r['network'] == new_route['network'] and
                            r['netmask'] == new_route['netmask']]
 
-        # If we have a route from this peer already, update it
+        # Check if a route from the same peer exists.
         peer_route_updated = False
         for i, route in enumerate(self.forwarding_table):
             if (route['network'] == new_route['network'] and
@@ -135,62 +212,90 @@ class Router:
                 peer_route_updated = True
                 break
 
-        # If we didn't update an existing route from this peer, add the new route
+        # If no route from this peer was found, add the new route.
         if not peer_route_updated:
             self.forwarding_table.append(new_route)
 
     def compare_routes(self, route1, route2):
         """
         Compare two routes using BGP selection criteria.
-        Returns True if route1 is preferred over route2.
+
+        The comparison is based on the following criteria (in order):
+            1. Highest local preference (localpref)
+            2. Whether the route is self-originated (selfOrigin)
+            3. Shortest ASPath length
+            4. Origin type (IGP > EGP > UNK)
+            5. Lowest peer IP address (using tuple comparison)
+
+        Parameters:
+            route1, route2 (dict): Two route dictionaries to compare.
+
+        Returns:
+            bool: True if route1 is preferred over route2, False otherwise.
         """
-        # 1. Highest localpref wins
+        # 1. Compare localpref values.
         loc1 = int(route1.get('localpref', 100))
         loc2 = int(route2.get('localpref', 100))
         if loc1 != loc2:
             return loc1 > loc2
 
-        # 2. selfOrigin wins
+        # 2. Compare selfOrigin flags.
         if route1.get('selfOrigin', False) != route2.get('selfOrigin', False):
             return route1.get('selfOrigin', False)
 
-        # 3. Shortest ASPath wins
+        # 3. Compare ASPath lengths.
         if len(route1['ASPath']) != len(route2['ASPath']):
             return len(route1['ASPath']) < len(route2['ASPath'])
 
-        # 4. Origin (IGP > EGP > UNK)
+        # 4. Compare based on origin type priorities.
         origin_priority = {"IGP": 3, "EGP": 2, "UNK": 1}
         origin1 = origin_priority.get(route1.get('origin', 'UNK'), 0)
         origin2 = origin_priority.get(route2.get('origin', 'UNK'), 0)
         if origin1 != origin2:
             return origin1 > origin2
 
-        # 5. Lowest peer IP
-        return ipaddress.IPv4Address(route1['peer']) < ipaddress.IPv4Address(route2['peer'])
+        # 5. Compare the peer IP addresses using tuple comparison.
+        return ip_to_tuple(route1['peer']) < ip_to_tuple(route2['peer'])
 
     def lookup_route(self, dest_ip):
-        """Find the best route for the given destination IP."""
-        dest = ipaddress.IPv4Address(dest_ip)
+        """
+        Look up the best matching route in the forwarding table for a given destination IP.
+
+        The process includes:
+            - Converting the destination IP to an integer.
+            - Finding all routes whose network covers the destination IP.
+            - Selecting the route with the longest matching prefix (most specific).
+            - Using compare_routes to break ties if needed.
+
+        Parameters:
+            dest_ip (str): The destination IP address.
+
+        Returns:
+            dict or None: The best route dictionary or None if no match is found.
+        """
+        dest_int = ip_str_to_int(dest_ip)
         matching_routes = []
         best_prefix_len = -1
 
-        # First find all matching routes
+        # Evaluate each route in the forwarding table.
         for route in self.forwarding_table:
-            network = ipaddress.IPv4Network(f"{route['network']}/{route['netmask']}", strict=False)
-            if dest in network:
-                prefix_len = network.prefixlen
+            # Convert the route's netmask to a prefix length.
+            prefix_len = netmask_to_prefix(route['netmask'])
+            # Check if the destination IP falls within the network.
+            if ip_in_network(dest_ip, route['network'], prefix_len):
                 if prefix_len > best_prefix_len:
-                    # Found a more specific route, clear previous matches
+                    # A more specific route is found; reset matching_routes.
                     best_prefix_len = prefix_len
                     matching_routes = [route]
                 elif prefix_len == best_prefix_len:
-                    # Found another route with same prefix length, add it
+                    # Another route with the same prefix length; add it.
                     matching_routes.append(route)
 
+        # If no routes match, return None.
         if not matching_routes:
             return None
 
-        # Among longest matches, find the best route
+        # From the matching routes, select the best one using compare_routes.
         best_route = matching_routes[0]
         for route in matching_routes[1:]:
             if self.compare_routes(route, best_route):
@@ -199,24 +304,48 @@ class Router:
         return best_route
 
     def can_forward_data(self, src_peer, dst_peer):
-        """Check if data forwarding is allowed based on relationships."""
+        """
+        Determine if data packets can be forwarded from a source neighbor to a destination neighbor.
+
+        Forwarding is allowed if either the source or destination is a customer.
+        Otherwise, data is not forwarded between peer/provider relationships.
+
+        Parameters:
+            src_peer (str): The source neighbor.
+            dst_peer (str): The destination neighbor.
+
+        Returns:
+            bool: True if data can be forwarded, False otherwise.
+        """
         src_relation = self.relations.get(src_peer)
         dst_relation = self.relations.get(dst_peer)
 
-        # Always forward if source or destination is a customer
+        # Allow forwarding if either side is a customer.
         if src_relation == 'cust' or dst_relation == 'cust':
             return True
 
-        # Don't forward from peer/provider to peer/provider
+        # Otherwise, do not allow forwarding between peer/provider.
         return False
 
     def handle_data(self, msg, src_interface):
-        """Process data packets."""
+        """
+        Process a data packet received from a neighbor.
+
+        Steps:
+            - Look up the best route for the destination IP in the message.
+            - If no route is found, send back a "no route" message.
+            - Check if forwarding is permitted by the relationship policy.
+            - If permitted, forward the data packet to the next hop.
+
+        Parameters:
+            msg (dict): The data message received.
+            src_interface (str): The neighbor interface from which the message was received.
+        """
         dest_ip = msg['dst']
         route = self.lookup_route(dest_ip)
 
+        # If no route exists, notify the source with a "no route" message.
         if route is None:
-            # No route found
             self.send(src_interface, json.dumps({
                 'src': self.our_addr(src_interface),
                 'dst': msg['src'],
@@ -225,7 +354,7 @@ class Router:
             }))
             return
 
-        # Check if forwarding is allowed
+        # If forwarding is not allowed, notify the source.
         if not self.can_forward_data(src_interface, route['peer']):
             self.send(src_interface, json.dumps({
                 'src': self.our_addr(src_interface),
@@ -235,12 +364,20 @@ class Router:
             }))
             return
 
-        # Forward the packet
+        # Forward the data packet to the next hop (peer).
         print(f"Forwarding data for {dest_ip} via peer {route['peer']}")
         self.send(route['peer'], json.dumps(msg))
 
     def handle_dump(self, msg, src_interface):
-        """Respond to table dump requests."""
+        """
+        Handle a table dump request.
+
+        Sends the current forwarding table back to the requester.
+
+        Parameters:
+            msg (dict): The dump request message.
+            src_interface (str): The neighbor from which the request was received.
+        """
         self.send(msg['src'], json.dumps({
             'src': self.our_addr(msg['src']),
             'dst': msg['src'],
@@ -248,13 +385,35 @@ class Router:
             'msg': self.forwarding_table
         }))
 
+    def handle_withdraw(self, msg, src_interface):
+        """
+        Handle a route withdraw message.
+
+        This stub implementation logs the withdraw message and appends it to the withdraws list.
+        Withdraw logic can be expanded as needed.
+
+        Parameters:
+            msg (dict): The withdraw message.
+            src_interface (str): The neighbor from which the message was received.
+        """
+        print(f"Withdraw message received from {src_interface}: {msg}")
+        self.withdraws.append((msg, src_interface))
+        # Additional withdraw logic can be implemented here.
+
     def run(self):
-        """Main event loop."""
+        """
+        Main event loop for the router.
+
+        Continuously listens for incoming messages on all neighbor sockets,
+        decodes them, and dispatches to the appropriate handler based on message type.
+        """
         while True:
+            # Use select to monitor all neighbor sockets with a timeout.
             socks = select.select(list(self.sockets.values()), [], [], 0.1)[0]
             for conn in socks:
-                data, addr = conn.recvfrom(65535)
+                data, addr = conn.recvfrom(65535)  # Receive data from a socket.
                 src_interface = None
+                # Identify which neighbor the message came from.
                 for neighbor, sock in self.sockets.items():
                     if sock == conn:
                         src_interface = neighbor
@@ -262,6 +421,7 @@ class Router:
 
                 msg_str = data.decode('utf-8')
                 try:
+                    # Attempt to decode the received JSON message.
                     msg = json.loads(msg_str)
                 except json.JSONDecodeError as e:
                     print(f"Failed to parse message: {msg_str}, {e}")
@@ -269,6 +429,7 @@ class Router:
 
                 print(f"Received message '{msg_str}' from {src_interface}")
 
+                # Dispatch the message to the corresponding handler based on type.
                 if msg['type'] == 'update':
                     self.handle_update(msg, src_interface)
                 elif msg['type'] == 'data':
@@ -278,14 +439,21 @@ class Router:
                 elif msg['type'] == 'withdraw':
                     self.handle_withdraw(msg, src_interface)
 
+            # Short sleep to avoid busy waiting.
             time.sleep(0.01)
 
 
+# Entry point for the program.
 if __name__ == "__main__":
+    # Parse command line arguments:
+    #   asn: Autonomous System Number for this router.
+    #   connections: List of neighbor connections in the format "port-neighbor-relation".
     parser = argparse.ArgumentParser(description='route packets')
     parser.add_argument('asn', type=int, help="AS number of this router")
     parser.add_argument('connections', metavar='connections', type=str, nargs='+',
                         help="connections")
     args = parser.parse_args()
+
+    # Create a Router instance and run its main loop.
     router = Router(args.asn, args.connections)
     router.run()
